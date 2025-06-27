@@ -6,11 +6,11 @@ import os, time
 
 app = FastAPI()
 
-# --- OpenAI ---
-client        = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-ASSISTANT_ID  = os.getenv("ASSISTANT_ID")  # обязательно есть в Railway Vars
+# ── OPENAI  ────────────────────────────────────────────────────────────────────
+client       = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+ASSISTANT_ID = os.getenv("ASSISTANT_ID")           # задаётся в Railway → Variables
 
-# --- Разрешённые домены ---
+# ── CORS ───────────────────────────────────────────────────────────────────────
 ALLOWED_ORIGINS = {
     "https://bizpartner.pl",
     "https://www.bizpartner.pl",
@@ -26,78 +26,78 @@ ALLOWED_ORIGINS = {
 }
 
 def cors_headers(origin: str) -> dict:
-    if origin in ALLOWED_ORIGINS:
-        return {
-            "Access-Control-Allow-Origin": origin,
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization",
-            "Access-Control-Allow-Credentials": "true",
-        }
+    """Формируем ответные CORS-заголовки."""
+    allow = origin if origin in ALLOWED_ORIGINS else "*"
     return {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Access-Control-Allow-Origin":      allow,
+        "Access-Control-Allow-Methods":     "POST, OPTIONS",
+        "Access-Control-Allow-Headers":     "Content-Type, Authorization",
+        "Access-Control-Allow-Credentials": "true" if allow != "*" else "false",
     }
 
-# --- Pydantic ---
+# ── Модель входящего запроса ──────────────────────────────────────────────────
 class ChatRequest(BaseModel):
-    message : str
-    lead_id : str | None = None
+    message: str
+    lead_id: str | None = None                # чтобы «привязать» тред к клиенту
 
-# --- Хранилище тредов (memory) ---
-lead_threads: dict[str,str] = {}
+# ── Хранилище соответствий lead_id ↔ thread_id (in-memory) ────────────────────
+lead_threads: dict[str, str] = {}
 
-# ----------  POST  /chat  ----------
+# ── POST /chat ────────────────────────────────────────────────────────────────
 @app.post("/chat")
 async def chat(req: ChatRequest, request: Request):
     origin = request.headers.get("origin", "")
     headers = cors_headers(origin)
 
     try:
-        # 1️⃣ Получаем / создаём thread
+        # 1. Получаем/создаём thread
         thread_id = lead_threads.get(req.lead_id) if req.lead_id else None
         if not thread_id:
             thread_id = client.beta.threads.create().id
             if req.lead_id:
                 lead_threads[req.lead_id] = thread_id
 
-        # 2️⃣ Добавляем сообщение пользователя
+        # 2. Пишем сообщение пользователя
         client.beta.threads.messages.create(
             thread_id=thread_id,
             role="user",
             content=req.message
         )
 
-        # 3️⃣ Запускаем ассистента
+        # 3. Запускаем ассистента
         run = client.beta.threads.runs.create(
             thread_id=thread_id,
-            assistant_id=ASSISTANT_ID,
+            assistant_id=ASSISTANT_ID
         )
 
-        # 4️⃣ Ждём завершения
+        # 4. Ожидаем завершения
         while True:
-            run = client.beta.threads.runs.retrieve(thread_id, run.id)
+            run = client.beta.threads.runs.retrieve(
+                thread_id=thread_id,
+                run_id=run.id                     # ← ключевое исправление!
+            )
             if run.status == "completed":
                 break
             if run.status in {"failed", "cancelled"}:
                 raise RuntimeError(f"Run {run.id} ended with status {run.status}")
             time.sleep(1)
 
-        # 5️⃣ Получаем последнее assistant-сообщение
+        # 5. Читаем ответ
         messages = client.beta.threads.messages.list(thread_id, order="desc")
-        assistant_reply = next(
-            (m.content[0].text.value for m in messages.data if m.role == "assistant"),
-            "⚠️ Ассистент не ответил."
-        )
+        reply = messages.data[0].content[0].text.value
 
-        return JSONResponse({"reply": assistant_reply}, headers=headers)
+        return JSONResponse({"reply": reply}, headers=headers)
 
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500, headers=headers)
+        return JSONResponse(
+            {"error": str(e)},
+            status_code=500,
+            headers=headers
+        )
 
-# ----------  OPTIONS  /chat  ----------
+# ── OPTIONS /chat (pre-flight CORS) ───────────────────────────────────────────
 @app.options("/chat")
-async def options_chat(request: Request):
+async def chat_options(request: Request):
     origin = request.headers.get("origin", "")
     headers = cors_headers(origin) | {"Access-Control-Max-Age": "86400"}
     return JSONResponse({}, status_code=204, headers=headers)
