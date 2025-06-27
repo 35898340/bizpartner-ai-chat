@@ -1,28 +1,27 @@
-# main.py  ─────────────────────────────────────────────────────────────────────
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from fastapi.responses import JSONResponse
 from openai import OpenAI
-import requests, os, time, logging
+import os, time, requests, json
 
-# ── BASE CONFIG ───────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+app = FastAPI()
 
-app           = FastAPI()
-client        = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-ASSISTANT_ID  = os.getenv("ASSISTANT_ID")          # задаётся в Railway → Variables
-SHEETS_URL    = os.getenv("SHEETS_WEBHOOK_URL")    # Webhook Google-таблицы (опц.)
+# ── OPENAI ────────────────────────────────────────────
+client       = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+ASSISTANT_ID = os.getenv("ASSISTANT_ID")
 
-# ── CORS ───────────────────────────────────────────────────────────────────────
+# ── Google Sheets Webhook (опционально) ───────────────
+SHEETS_WEBHOOK_URL = os.getenv("SHEETS_WEBHOOK_URL")   # можно не задавать
+
+# ── CORS ──────────────────────────────────────────────
 ALLOWED_ORIGINS = {
     "https://bizpartner.pl",  "https://www.bizpartner.pl",
     "http://bizpartner.pl",   "http://www.bizpartner.pl",
-    "https://lovable.dev",    "https://lovable.io",   "https://lovable.app",
+    "https://lovable.dev",    "https://lovable.io",  "https://lovable.app",
     "http://localhost:3000",  "http://localhost:5173",
     "http://127.0.0.1:3000",  "http://127.0.0.1:5173",
 }
-
-def cors_headers(origin: str) -> dict:
+def cors(origin: str) -> dict:
     allow = origin if origin in ALLOWED_ORIGINS else "*"
     return {
         "Access-Control-Allow-Origin":      allow,
@@ -31,79 +30,87 @@ def cors_headers(origin: str) -> dict:
         "Access-Control-Allow-Credentials": "true" if allow != "*" else "false",
     }
 
-# ── STORE lead_id ↔ thread_id (in-memory) ─────────────────────────────────────
-lead_threads: dict[str, str] = {}
-
-# ── PUSH TO SHEETS (необязательно; вызывается, если задан SHEETS_URL) ─────────
-def push_to_sheets(lead_id: str | None, role: str, content: str) -> None:
-    if not SHEETS_URL:
-        return
-    try:
-        resp = requests.post(
-            SHEETS_URL,
-            json={"lead_id": lead_id, "role": role, "content": content},
-            timeout=4,
-        )
-        logging.info("Sheets %s %s", resp.status_code, resp.text[:100])
-    except requests.RequestException as e:
-        logging.warning("Sheets push failed: %s", e)
-
-# ── Pydantic-модель входящего запроса ─────────────────────────────────────────
+# ── Модель запроса ───────────────────────────────────
 class ChatRequest(BaseModel):
     message: str
-    lead_id: str | None = None   # чтобы «привязать» тред к конкретному ли́ду
+    lead_id: str | None = None          # чтобы «склеить» сообщения одного лида
 
-# ── POST /chat ────────────────────────────────────────────────────────────────
+# in-memory map  lead_id → thread_id
+lead_threads: dict[str, str] = {}
+
+# ── helpers ───────────────────────────────────────────
+def push_to_sheets(payload: dict):
+    """Отправляем JSON одной строкой в Google Sheets (Apps Script Webhook)."""
+    if not SHEETS_WEBHOOK_URL:
+        return
+    try:
+        requests.post(
+            SHEETS_WEBHOOK_URL,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            timeout=4,
+        )
+    except Exception:
+        # Журналируем, но не роняем весь чаторбот
+        pass
+
+# ── POST /chat ───────────────────────────────────────
 @app.post("/chat")
 async def chat(req: ChatRequest, request: Request):
-    origin   = request.headers.get("origin", "")
-    headers  = cors_headers(origin)
+    origin  = request.headers.get("origin", "")
+    headers = cors(origin)
 
     try:
-        # 1. получаем / создаём thread
+        # 1️⃣ thread для лида
         thread_id = lead_threads.get(req.lead_id) if req.lead_id else None
         if not thread_id:
             thread_id = client.beta.threads.create().id
             if req.lead_id:
                 lead_threads[req.lead_id] = thread_id
 
-        # 2. пишем сообщение пользователя
+        # 2️⃣ сообщение пользователя
         client.beta.threads.messages.create(
             thread_id=thread_id,
             role="user",
-            content=req.message
+            content=req.message,
         )
-        push_to_sheets(req.lead_id, "user", req.message)   # ← логируем
 
-        # 3. запускаем ассистента
+        # 3️⃣ запуск ассистента
         run = client.beta.threads.runs.create(
             thread_id=thread_id,
-            assistant_id=ASSISTANT_ID
+            assistant_id=ASSISTANT_ID,
         )
 
-        # 4. ждём завершения
+        # 4️⃣ ждём завершения
         while True:
-            run = client.beta.threads.runs.retrieve(thread_id, run.id)
+            run = client.beta.threads.runs.retrieve(thread_id, run.id)  # ← ✔️ только 2 аргумента
             if run.status == "completed":
                 break
             if run.status in {"failed", "cancelled"}:
                 raise RuntimeError(f"Run {run.id} ended with status {run.status}")
             time.sleep(1)
 
-        # 5. читаем ответ
+        # 5️⃣ берём ответ ассистента
         messages = client.beta.threads.messages.list(thread_id, order="desc")
-        reply = messages.data[0].content[0].text.value
-        push_to_sheets(req.lead_id, "assistant", reply)    # ← логируем
+        reply    = messages.data[0].content[0].text.value
+
+        # 6️⃣ логируем в Google Sheets (если надо)
+        push_to_sheets({
+            "timestamp": time.time(),
+            "lead_id":   req.lead_id,
+            "question":  req.message,
+            "answer":    reply,
+            "thread_id": thread_id,
+        })
 
         return JSONResponse({"reply": reply}, headers=headers)
 
     except Exception as e:
-        logging.exception("Chat error")
         return JSONResponse({"error": str(e)}, status_code=500, headers=headers)
 
-# ── OPTIONS /chat  (pre-flight CORS) ──────────────────────────────────────────
+# ── OPTIONS /chat (pre-flight) ───────────────────────
 @app.options("/chat")
 async def chat_options(request: Request):
     origin  = request.headers.get("origin", "")
-    headers = cors_headers(origin) | {"Access-Control-Max-Age": "86400"}
+    headers = cors(origin) | {"Access-Control-Max-Age": "86400"}
     return JSONResponse({}, status_code=204, headers=headers)
