@@ -1,5 +1,5 @@
 # ────────────────────────────────────────────────────────────────────────────
-#  BizPartner-AI · FastAPI + OpenAI Assistants · Tracing ON
+#  BizPartner-AI · FastAPI + OpenAI Assistants · baseline (без Traces)
 # ────────────────────────────────────────────────────────────────────────────
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -10,10 +10,7 @@ import os, time, traceback, sys
 app = FastAPI()
 
 # ── OpenAI ───────────────────────────────────────────────────────────────
-client = OpenAI(
-    api_key        = os.getenv("OPENAI_API_KEY"),
-    enable_tracing = True                       # ← присылать события в Traces
-)
+client       = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 ASSISTANT_ID = os.getenv("ASSISTANT_ID")        # Railway → Variables
 
 # ── CORS ─────────────────────────────────────────────────────────────────
@@ -26,7 +23,6 @@ ALLOWED_ORIGINS = {
 }
 
 def cors_headers(origin: str) -> dict:
-    """CORS-заголовки ответа."""
     allow = origin if origin in ALLOWED_ORIGINS else "*"
     return {
         "Access-Control-Allow-Origin":      allow,
@@ -35,10 +31,10 @@ def cors_headers(origin: str) -> dict:
         "Access-Control-Allow-Credentials": "true" if allow != "*" else "false",
     }
 
-# ── In-memory хранилище lead_id ↔ thread_id ────────────────────────────
+# ── In-memory map lead_id ↔ thread_id ───────────────────────────────────
 lead_threads: dict[str, str] = {}
 
-# ── Schema входящего JSON ───────────────────────────────────────────────
+# ── Schema входящего запроса ────────────────────────────────────────────
 class ChatRequest(BaseModel):
     message: str
     lead_id: str | None = None
@@ -70,10 +66,10 @@ async def chat(req: ChatRequest, request: Request):
             assistant_id=ASSISTANT_ID
         )
 
-        # 4. Ожидание выполнения
+        # 4. Ожидание завершения
         while True:
             run = client.beta.threads.runs.retrieve(
-                run_id   = run.id,           # ← обязательно именованные арг-ты
+                run_id   = run.id,          # обязательно именованные арг-ты!
                 thread_id=thread_id
             )
             if run.status == "completed":
@@ -89,10 +85,10 @@ async def chat(req: ChatRequest, request: Request):
         return JSONResponse({"reply": reply}, headers=headers)
 
     except Exception as e:
-        traceback.print_exc(file=sys.stderr)     # увидеть 500-ошибку в логах
+        traceback.print_exc(file=sys.stderr)     # выводим стек в логи Railway
         return JSONResponse({"error": str(e)}, status_code=500, headers=headers)
 
-# ── OPTIONS /chat (pre-flight) ───────────────────────────────────────────
+# ── OPTIONS /chat (CORS pre-flight) ─────────────────────────────────────
 @app.options("/chat")
 async def chat_options(request: Request):
     origin  = request.headers.get("origin", "")
