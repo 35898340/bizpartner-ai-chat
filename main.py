@@ -10,11 +10,19 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 ALLOWED_ORIGINS = [
     "https://bizpartner.pl",
     "https://www.bizpartner.pl",
+    "http://bizpartner.pl",
+    "http://www.bizpartner.pl",
     "https://lovable.dev",
-    "https://lovable.io"
+    "https://lovable.io",
+    "https://lovable.app",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173"
 ]
 
 def get_cors_headers(origin: str) -> dict:
+    print(f"Origin received: '{origin}' - Allowed: {origin in ALLOWED_ORIGINS}")
     if origin in ALLOWED_ORIGINS:
         return {
             "Access-Control-Allow-Origin": origin,
