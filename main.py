@@ -6,26 +6,20 @@ import os
 
 app = FastAPI()
 
-# ✅ Разрешаем только нужные домены (всё с маленьких букв!)
+# ❗ ВРЕМЕННО разрешаем все домены (для отладки)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://bizpartner.pl",
-        "https://www.bizpartner.pl"
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 🔑 Ключ от OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# 📥 Модель входящего запроса
 class ChatRequest(BaseModel):
     message: str
 
-# 💬 Основной эндпоинт
 @app.post("/chat")
 async def chat(req: ChatRequest):
     try:
