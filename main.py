@@ -7,6 +7,29 @@ import os
 app = FastAPI()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+ALLOWED_ORIGINS = [
+    "https://bizpartner.pl",
+    "https://www.bizpartner.pl",
+    "https://lovable.dev",
+    "https://lovable.io"
+]
+
+def get_cors_headers(origin: str) -> dict:
+    if origin in ALLOWED_ORIGINS:
+        return {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            "Access-Control-Allow-Credentials": "true",
+        }
+    else:
+        return {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            "Access-Control-Allow-Credentials": "false",
+        }
+
 class ChatRequest(BaseModel):
     message: str
 
@@ -19,23 +42,23 @@ async def chat(req: ChatRequest, request: Request):
              "content": "You are a helpful assistant…"},
             {"role": "user", "content": req.message}]
     )
+    
+    origin = request.headers.get("origin", "")
+    cors_headers = get_cors_headers(origin)
+    
     return JSONResponse(
         {"reply": data.choices[0].message.content},
-        headers={
-            "Access-Control-Allow-Origin": request.headers.get("origin", "*"),
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type",
-        }
+        headers=cors_headers
     )
 
 @app.options("/chat")
 async def chat_options(request: Request):
+    origin = request.headers.get("origin", "")
+    cors_headers = get_cors_headers(origin)
+    cors_headers["Access-Control-Max-Age"] = "86400"
+    
     return JSONResponse(
         {},
-        status_code=204,
-        headers={
-            "Access-Control-Allow-Origin": request.headers.get("origin", "*"),
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type",
-        }
+        status_code=200,
+        headers=cors_headers
     )
