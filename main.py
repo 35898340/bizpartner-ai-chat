@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from openai import OpenAI
@@ -8,20 +7,23 @@ import os
 
 app = FastAPI()
 
-# ✅ CORS
+# ✅ CORS (временно открыт для всех)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Пока для теста
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ✅ OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# ✅ Input schema
 class ChatRequest(BaseModel):
     message: str
 
+# ✅ POST /chat — основной запрос от пользователя
 @app.post("/chat")
 async def chat(req: ChatRequest):
     try:
@@ -42,9 +44,9 @@ async def chat(req: ChatRequest):
     except Exception as e:
         return {"reply": f"⚠️ Ошибка: {str(e)}"}
 
-# ✅ ОБЯЗАТЕЛЬНО — ручная обработка preflight OPTIONS
+# ✅ OPTIONS /chat — ручная обработка preflight
 @app.options("/chat")
-async def preflight(request: Request):
+async def chat_preflight(request: Request):
     return JSONResponse(
         content={},
         status_code=204,
