@@ -7,23 +7,23 @@ import os
 
 app = FastAPI()
 
-# ✅ Временно разрешаем все домены (для отладки CORS)
+# ✅ Разрешаем временно все домены — важно для теста
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ← заменим позже на твой домен
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 🔑 Ключ OpenAI
+# ✅ OpenAI клиент
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# 📥 Входящие данные
+# ✅ Структура запроса
 class ChatRequest(BaseModel):
     message: str
 
-# 💬 Обработка POST-запроса
+# ✅ Основной чат-эндпоинт
 @app.post("/chat")
 async def chat(req: ChatRequest):
     try:
@@ -44,7 +44,15 @@ async def chat(req: ChatRequest):
     except Exception as e:
         return {"reply": f"⚠️ Ошибка: {str(e)}"}
 
-# ⚙️ Обработка preflight-запроса (OPTIONS /chat)
+# ✅ Обработка preflight-запроса от браузера
 @app.options("/chat")
 async def options_handler(request: Request):
-    return JSONResponse(content={}, status_code=204)
+    return JSONResponse(
+        content={},
+        status_code=204,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
+        }
+    )
