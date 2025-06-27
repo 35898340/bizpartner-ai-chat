@@ -1,28 +1,27 @@
-from fastapi import FastAPI
+
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from openai import OpenAI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import os
 
 app = FastAPI()
 
-# ✅ Разрешаем CORS (временно для всех доменов — можно заменить на свой позже)
+# ✅ CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ← здесь можно поставить ["https://bizpartner.pl"]
+    allow_origins=["*"],  # Пока для теста
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ✅ Инициализация OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# ✅ Структура входящего запроса
 class ChatRequest(BaseModel):
     message: str
 
-# ✅ Основной эндпоинт
 @app.post("/chat")
 async def chat(req: ChatRequest):
     try:
@@ -42,3 +41,16 @@ async def chat(req: ChatRequest):
         return {"reply": response.choices[0].message.content}
     except Exception as e:
         return {"reply": f"⚠️ Ошибка: {str(e)}"}
+
+# ✅ ОБЯЗАТЕЛЬНО — ручная обработка preflight OPTIONS
+@app.options("/chat")
+async def preflight(request: Request):
+    return JSONResponse(
+        content={},
+        status_code=204,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
+        }
+    )
