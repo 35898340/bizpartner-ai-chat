@@ -5,8 +5,14 @@ from fastapi.responses import JSONResponse
 import os
 
 app = FastAPI()
+
+# ✅ Инициализация клиента OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# ✅ Получаем Assistant ID из переменной окружения
+ASSISTANT_ID = os.getenv("ASSISTANT_ID")
+
+# ✅ Разрешённые домены для CORS
 ALLOWED_ORIGINS = [
     "https://bizpartner.pl",
     "https://www.bizpartner.pl",
@@ -46,14 +52,14 @@ async def chat(req: ChatRequest, request: Request):
     data = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system",
-             "content": "You are a helpful assistant…"},
-            {"role": "user", "content": req.message}]
+            {"role": "system", "content": "You are a helpful assistant…"},
+            {"role": "user", "content": req.message}
+        ]
     )
-    
+
     origin = request.headers.get("origin", "")
     cors_headers = get_cors_headers(origin)
-    
+
     return JSONResponse(
         {"reply": data.choices[0].message.content},
         headers=cors_headers
@@ -64,7 +70,7 @@ async def chat_options(request: Request):
     origin = request.headers.get("origin", "")
     cors_headers = get_cors_headers(origin)
     cors_headers["Access-Control-Max-Age"] = "86400"
-    
+
     return JSONResponse(
         {},
         status_code=200,
