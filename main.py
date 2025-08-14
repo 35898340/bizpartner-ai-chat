@@ -2,7 +2,7 @@
 #  BizPartner-AI · FastAPI + OpenAI Assistants  (рабочая «базовая» версия)
 # ────────────────────────────────────────────────────────────────────────────
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from openai import OpenAI
 import os, time, json
@@ -182,4 +182,4 @@ async def chat(req: ChatRequest, request: Request):
 async def chat_options(request: Request):
     origin  = request.headers.get("origin", "")
     headers = cors_headers(origin) | {"Access-Control-Max-Age": "86400"}
-    return JSONResponse({}, status_code=204, headers=headers)
+    return Response(status_code=204, headers=headers)
