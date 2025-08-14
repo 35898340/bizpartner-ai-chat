@@ -8,6 +8,8 @@ from openai import OpenAI
 import os, time, json, asyncio
 import requests
 
+DEBUG = os.getenv("DEBUG", "0") in {"1", "true", "True", "yes", "on"}
+
 app = FastAPI()
 
 # ── OpenAI ────────────────────────────────────────────────────────────────
@@ -41,7 +43,7 @@ def cors_headers(origin: str) -> dict:
     return {
         "Access-Control-Allow-Origin":      allow_origin,
         "Access-Control-Allow-Methods":     "POST, OPTIONS",
-        "Access-Control-Allow-Headers":     "Content-Type, Authorization",
+        "Access-Control-Allow-Headers":     "Content-Type, Authorization, X-Requested-With",
         "Access-Control-Allow-Credentials": "true" if allow_origin != "*" else "false",
         "Vary": "Origin",
     }
@@ -123,12 +125,17 @@ async def chat(req: ChatRequest, request: Request):
     headers = cors_headers(origin)
 
     try:
+        if DEBUG:
+            print(f"[chat] origin={origin} lead_id_in={req.lead_id} message={req.message[:80]!r}")
+
         # 1. thread для клиента
         thread_id = lead_threads.get(req.lead_id) if req.lead_id else None
         if not thread_id:
             thread_id = client.beta.threads.create().id
             if req.lead_id:
                 lead_threads[req.lead_id] = thread_id
+        if DEBUG:
+            print(f"[chat] thread_id={thread_id}")
 
         # 2. сообщение пользователя
         client.beta.threads.messages.create(
@@ -142,6 +149,8 @@ async def chat(req: ChatRequest, request: Request):
             thread_id=thread_id,
             assistant_id=ASSISTANT_ID
         )
+        if DEBUG:
+            print(f"[chat] run_id={run.id}")
 
         last_lead_id: int | None = None
         deadline = time.time() + 90  # fail-safe to avoid indefinite wait
@@ -153,9 +162,13 @@ async def chat(req: ChatRequest, request: Request):
                 run_id=run.id,
                 thread_id=thread_id
             )
+            if DEBUG:
+                print(f"[chat] run_status={run_status.status}")
 
             if run_status.status == "requires_action":
                 tool_calls = run_status.required_action.submit_tool_outputs.tool_calls
+                if DEBUG:
+                    print(f"[chat] requires_action: {len(tool_calls)} tool_calls")
                 tool_outputs = []
                 for tool_call in tool_calls:
                     fn_name = tool_call.function.name
@@ -163,34 +176,36 @@ async def chat(req: ChatRequest, request: Request):
                         fn_args = json.loads(tool_call.function.arguments or "{}")
                     except Exception:
                         fn_args = {}
+                    if DEBUG:
+                        print(f"[chat] tool_call: {fn_name} args={fn_args}")
 
                     try:
                         if fn_name in {"create_bitrix_lead", "crm_create_lead", "create_lead"}:
                             lead_id = create_bitrix_lead(fn_args)
                             last_lead_id = lead_id
-                            tool_outputs.append({
-                                "tool_call_id": tool_call.id,
-                                "output": json.dumps({"ok": True, "lead_id": lead_id})
-                            })
+                            out = {"ok": True, "lead_id": lead_id}
                         else:
-                            tool_outputs.append({
-                                "tool_call_id": tool_call.id,
-                                "output": json.dumps({"ok": False, "error": f"unknown function: {fn_name}"})
-                            })
+                            out = {"ok": False, "error": f"unknown function: {fn_name}"}
                     except Exception as tool_error:
-                        tool_outputs.append({
-                            "tool_call_id": tool_call.id,
-                            "output": json.dumps({"ok": False, "error": str(tool_error)})
-                        })
+                        out = {"ok": False, "error": str(tool_error)}
+
+                    tool_outputs.append({
+                        "tool_call_id": tool_call.id,
+                        "output": json.dumps(out)
+                    })
 
                 client.beta.threads.runs.submit_tool_outputs(
                     thread_id=thread_id,
                     run_id=run_status.id,
                     tool_outputs=tool_outputs
                 )
+                if DEBUG:
+                    print(f"[chat] submit_tool_outputs sent: {tool_outputs}")
                 continue
 
             if run_status.status == "completed":
+                if DEBUG:
+                    print("[chat] run completed")
                 break
             if run_status.status in {"failed", "cancelled", "expired"}:
                 raise RuntimeError(f"Run {run.id} ended with {run_status.status}")
@@ -198,6 +213,8 @@ async def chat(req: ChatRequest, request: Request):
 
         # 5. ответ ассистента
         reply = _extract_last_text_message(client, thread_id) or ""
+        if DEBUG:
+            print(f"[chat] reply_len={len(reply)} last_lead_id={last_lead_id}")
 
         resp = {"reply": reply}
         if last_lead_id is not None:
@@ -205,6 +222,8 @@ async def chat(req: ChatRequest, request: Request):
         return JSONResponse(resp, headers=headers)
 
     except Exception as e:
+        if DEBUG:
+            print(f"[chat] error: {e}")
         return JSONResponse(
             {"error": str(e)},
             status_code=500,
@@ -215,5 +234,9 @@ async def chat(req: ChatRequest, request: Request):
 @app.options("/chat")
 async def chat_options(request: Request):
     origin  = request.headers.get("origin", "")
-    headers = cors_headers(origin) | {"Access-Control-Max-Age": "86400"}
+    headers = cors_headers(origin).copy()
+    acrh = request.headers.get("access-control-request-headers")
+    if acrh:
+        headers["Access-Control-Allow-Headers"] = acrh
+    headers["Access-Control-Max-Age"] = "86400"
     return Response(status_code=204, headers=headers)
