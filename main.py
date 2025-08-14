@@ -7,6 +7,14 @@ from pydantic import BaseModel
 from openai import OpenAI
 import os, time, json, asyncio
 import requests
+from datetime import datetime, timezone
+from typing import Optional
+
+# ── Persistence (SQLAlchemy) ───────────────────────────────────────────────
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Text, DateTime, ForeignKey, JSON as SA_JSON
+)
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 
 DEBUG = os.getenv("DEBUG", "0") in {"1", "true", "True", "yes", "on"}
 
@@ -16,6 +24,43 @@ app = FastAPI()
 client       = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 ASSISTANT_ID = os.getenv("ASSISTANT_ID")            # Railway → Variables
 BITRIX_WEBHOOK_URL = os.getenv("BITRIX_WEBHOOK_URL") or os.getenv("BITRIX_WEBHOOK")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# ── DB setup ───────────────────────────────────────────────────────────────
+Base = declarative_base()
+engine = create_engine(DATABASE_URL) if DATABASE_URL else None
+SessionLocal = sessionmaker(bind=engine) if engine else None
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+    id = Column(Integer, primary_key=True)
+    thread_id = Column(String(128), unique=True, index=True, nullable=False)
+    lead_id = Column(Integer, nullable=True)
+    origin = Column(String(256), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan")
+
+class Message(Base):
+    __tablename__ = "messages"
+    id = Column(Integer, primary_key=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
+    role = Column(String(32), nullable=False)  # user | assistant | tool
+    content = Column(Text, nullable=False)
+    tool_name = Column(String(128), nullable=True)
+    tool_args = Column(SA_JSON, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    conversation = relationship("Conversation", back_populates="messages")
+
+if engine:
+    try:
+        Base.metadata.create_all(engine)
+        if DEBUG:
+            print("[db] Tables ensured")
+    except Exception as _e:
+        if DEBUG:
+            print(f"[db] init error: {_e}")
 
 # ── CORS ──────────────────────────────────────────────────────────────────
 ALLOWED_ORIGINS = {
@@ -113,6 +158,47 @@ def _extract_last_text_message(client: OpenAI, thread_id: str) -> str:
                     return text_value
     return ""
 
+# ── DB helpers ─────────────────────────────────────────────────────────────
+
+def _db_session():
+    if not SessionLocal:
+        return None
+    return SessionLocal()
+
+def _get_or_create_conversation(session, thread_id: str, origin: Optional[str], lead_id: Optional[int] = None) -> Conversation:
+    conv = session.query(Conversation).filter_by(thread_id=thread_id).one_or_none()
+    if conv is None:
+        conv = Conversation(thread_id=thread_id, origin=origin, lead_id=lead_id)
+        session.add(conv)
+        session.commit()
+        session.refresh(conv)
+    else:
+        if lead_id is not None and conv.lead_id is None:
+            conv.lead_id = lead_id
+            session.commit()
+    return conv
+
+def _save_message(thread_id: str, origin: Optional[str], role: str, content: str, *, tool_name: Optional[str] = None, tool_args: Optional[dict] = None, lead_id: Optional[int] = None) -> None:
+    session = _db_session()
+    if not session:
+        return
+    try:
+        conv = _get_or_create_conversation(session, thread_id, origin, lead_id)
+        msg = Message(
+            conversation_id=conv.id,
+            role=role,
+            content=content or "",
+            tool_name=tool_name,
+            tool_args=tool_args,
+        )
+        session.add(msg)
+        session.commit()
+    except Exception as e:
+        if DEBUG:
+            print(f"[db] save_message error: {e}")
+    finally:
+        session.close()
+
 # ── Модель входящего запроса ──────────────────────────────────────────────
 class ChatRequest(BaseModel):
     message: str
@@ -143,6 +229,11 @@ async def chat(req: ChatRequest, request: Request):
             role="user",
             content=req.message
         )
+        # Persist user message
+        try:
+            _save_message(thread_id, origin, role="user", content=req.message)
+        except Exception:
+            pass
 
         # 3. запуск ассистента и обработка tool calls
         run = client.beta.threads.runs.create(
@@ -179,11 +270,21 @@ async def chat(req: ChatRequest, request: Request):
                     if DEBUG:
                         print(f"[chat] tool_call: {fn_name} args={fn_args}")
 
+                    out: dict
                     try:
                         if fn_name in {"create_bitrix_lead", "crm_create_lead", "create_lead"}:
-                            lead_id = create_bitrix_lead(fn_args)
-                            last_lead_id = lead_id
-                            out = {"ok": True, "lead_id": lead_id}
+                            lead_id_val = create_bitrix_lead(fn_args)
+                            last_lead_id = lead_id_val
+                            out = {"ok": True, "lead_id": lead_id_val}
+                            # Persist tool call
+                            try:
+                                _save_message(
+                                    thread_id, origin, role="tool",
+                                    content=json.dumps(out),
+                                    tool_name=fn_name, tool_args=fn_args, lead_id=lead_id_val,
+                                )
+                            except Exception:
+                                pass
                         else:
                             out = {"ok": False, "error": f"unknown function: {fn_name}"}
                     except Exception as tool_error:
@@ -215,6 +316,11 @@ async def chat(req: ChatRequest, request: Request):
         reply = _extract_last_text_message(client, thread_id) or ""
         if DEBUG:
             print(f"[chat] reply_len={len(reply)} last_lead_id={last_lead_id}")
+        # Persist assistant reply
+        try:
+            _save_message(thread_id, origin, role="assistant", content=reply, lead_id=last_lead_id)
+        except Exception:
+            pass
 
         resp = {"reply": reply}
         if last_lead_id is not None:
