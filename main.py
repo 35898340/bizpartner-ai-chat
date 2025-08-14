@@ -2,17 +2,17 @@
 #  BizPartner-AI · FastAPI + OpenAI Assistants  (рабочая «базовая» версия)
 # ────────────────────────────────────────────────────────────────────────────
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from openai import OpenAI
-import os, time, json, asyncio
+import os, time, json, asyncio, csv, io
 import requests
 from datetime import datetime, timezone
 from typing import Optional
 
 # ── Persistence (SQLAlchemy) ───────────────────────────────────────────────
 from sqlalchemy import (
-    create_engine, Column, Integer, String, Text, DateTime, ForeignKey, JSON as SA_JSON
+    create_engine, Column, Integer, String, Text, DateTime, ForeignKey, JSON as SA_JSON, func
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 
@@ -29,7 +29,7 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 
 # ── DB setup ───────────────────────────────────────────────────────────────
 Base = declarative_base()
-engine = create_engine(DATABASE_URL) if DATABASE_URL else None
+engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else None
 SessionLocal = sessionmaker(bind=engine) if engine else None
 
 class Conversation(Base):
@@ -199,6 +199,27 @@ def _save_message(thread_id: str, origin: Optional[str], role: str, content: str
             print(f"[db] save_message error: {e}")
     finally:
         session.close()
+
+def _parse_bool(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    val = value.strip().lower()
+    if val in {"1", "true", "yes", "on"}:
+        return True
+    if val in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+def _parse_dt(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
 
 # ── Модель входящего запроса ──────────────────────────────────────────────
 class ChatRequest(BaseModel):
@@ -371,25 +392,76 @@ async def admin_list_conversations(request: Request):
 
     limit_param = request.query_params.get("limit", "50")
     offset_param = request.query_params.get("offset", "0")
+    from_param = request.query_params.get("from")
+    to_param = request.query_params.get("to")
+    origin_param = request.query_params.get("origin")  # exact or suffix with leading *
+    has_lead_param = request.query_params.get("has_lead")
+    thread_param = request.query_params.get("thread_id")
+    sort_by = request.query_params.get("sort_by", "created_at")  # created_at|id
+    sort_dir = request.query_params.get("sort_dir", "desc")       # asc|desc
+
     try:
         limit = max(1, min(200, int(limit_param)))
         offset = max(0, int(offset_param))
     except Exception:
         limit, offset = 50, 0
 
+    dt_from = _parse_dt(from_param)
+    dt_to = _parse_dt(to_param)
+    has_lead = _parse_bool(has_lead_param)
+
     session = SessionLocal()
     try:
-        q = session.query(Conversation).order_by(Conversation.created_at.desc())
+        q = session.query(Conversation)
+        if dt_from:
+            q = q.filter(Conversation.created_at >= dt_from)
+        if dt_to:
+            q = q.filter(Conversation.created_at <= dt_to)
+        if thread_param:
+            q = q.filter(Conversation.thread_id == thread_param)
+        if origin_param:
+            if origin_param.startswith("*"):
+                q = q.filter(Conversation.origin.ilike(f"%{origin_param[1:]}"))
+            else:
+                q = q.filter(Conversation.origin == origin_param)
+        if has_lead is True:
+            q = q.filter(Conversation.lead_id.isnot(None))
+        elif has_lead is False:
+            q = q.filter(Conversation.lead_id.is_(None))
+
+        # sort
+        order_col = Conversation.created_at if sort_by == "created_at" else Conversation.id
+        if sort_dir == "asc":
+            q = q.order_by(order_col.asc())
+        else:
+            q = q.order_by(order_col.desc())
+
         total = q.count()
         conversations = q.offset(offset).limit(limit).all()
+        # augment with messages_count and last_message_at
+        conv_ids = [c.id for c in conversations]
+        stats = {}
+        if conv_ids:
+            mstats = (
+                session.query(Message.conversation_id, func.count(Message.id), func.max(Message.created_at))
+                .filter(Message.conversation_id.in_(conv_ids))
+                .group_by(Message.conversation_id)
+                .all()
+            )
+            for cid, cnt, last_dt in mstats:
+                stats[cid] = {"messages_count": int(cnt), "last_message_at": last_dt.isoformat() if last_dt else None}
+
         items = []
         for c in conversations:
+            s = stats.get(c.id, {"messages_count": 0, "last_message_at": None})
             items.append({
                 "id": c.id,
                 "thread_id": c.thread_id,
                 "lead_id": c.lead_id,
                 "origin": c.origin,
                 "created_at": c.created_at.isoformat() if c.created_at else None,
+                "messages_count": s["messages_count"],
+                "last_message_at": s["last_message_at"],
             })
         return JSONResponse({"total": total, "limit": limit, "offset": offset, "items": items})
     finally:
@@ -482,3 +554,272 @@ async def admin_get_thread_messages(thread_id: str, request: Request):
         })
     finally:
         session.close()
+
+@app.get("/admin/messages")
+async def admin_list_messages(request: Request):
+    try:
+        _require_admin(request)
+    except PermissionError as e:
+        return JSONResponse({"error": str(e)}, status_code=401)
+
+    if not SessionLocal:
+        return JSONResponse({"error": "DATABASE_URL is not configured"}, status_code=501)
+
+    qp = request.query_params
+    limit_param = qp.get("limit", "100")
+    offset_param = qp.get("offset", "0")
+    roles_param = qp.get("role")  # e.g. user,assistant,tool
+    from_param = qp.get("from")
+    to_param = qp.get("to")
+    lead_param = qp.get("lead_id")
+    has_lead_param = qp.get("has_lead")
+    thread_param = qp.get("thread_id")
+    origin_param = qp.get("origin")
+    tool_param = qp.get("tool_name")
+    search_param = qp.get("search")
+    sort_by = qp.get("sort_by", "created_at")   # created_at|id
+    sort_dir = qp.get("sort_dir", "desc")       # asc|desc
+
+    try:
+        limit = max(1, min(500, int(limit_param)))
+        offset = max(0, int(offset_param))
+    except Exception:
+        limit, offset = 100, 0
+
+    dt_from = _parse_dt(from_param)
+    dt_to = _parse_dt(to_param)
+    has_lead = _parse_bool(has_lead_param)
+
+    roles = None
+    if roles_param:
+        roles = [r.strip() for r in roles_param.split(',') if r.strip()]
+
+    session = SessionLocal()
+    try:
+        q = session.query(Message, Conversation).join(Conversation, Message.conversation_id == Conversation.id)
+        if roles:
+            q = q.filter(Message.role.in_(roles))
+        if dt_from:
+            q = q.filter(Message.created_at >= dt_from)
+        if dt_to:
+            q = q.filter(Message.created_at <= dt_to)
+        if lead_param:
+            try:
+                lead_val = int(lead_param)
+                q = q.filter(Conversation.lead_id == lead_val)
+            except Exception:
+                pass
+        if has_lead is True:
+            q = q.filter(Conversation.lead_id.isnot(None))
+        elif has_lead is False:
+            q = q.filter(Conversation.lead_id.is_(None))
+        if thread_param:
+            q = q.filter(Conversation.thread_id == thread_param)
+        if origin_param:
+            if origin_param.startswith("*"):
+                q = q.filter(Conversation.origin.ilike(f"%{origin_param[1:]}"))
+            else:
+                q = q.filter(Conversation.origin == origin_param)
+        if tool_param:
+            if tool_param == "*":
+                q = q.filter(Message.tool_name.isnot(None))
+            else:
+                q = q.filter(Message.tool_name == tool_param)
+        if search_param:
+            q = q.filter(Message.content.ilike(f"%{search_param}%"))
+
+        order_col = Message.created_at if sort_by == "created_at" else Message.id
+        if sort_dir == "asc":
+            q = q.order_by(order_col.asc())
+        else:
+            q = q.order_by(order_col.desc())
+
+        total = q.count()
+        rows = q.offset(offset).limit(limit).all()
+        items = []
+        for m, c in rows:
+            items.append({
+                "id": m.id,
+                "role": m.role,
+                "content": m.content,
+                "tool_name": m.tool_name,
+                "tool_args": m.tool_args,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+                "conversation": {
+                    "id": c.id,
+                    "thread_id": c.thread_id,
+                    "lead_id": c.lead_id,
+                    "origin": c.origin,
+                    "created_at": c.created_at.isoformat() if c.created_at else None,
+                }
+            })
+        return JSONResponse({"total": total, "limit": limit, "offset": offset, "items": items})
+    finally:
+        session.close()
+
+@app.get("/admin/export/messages.ndjson")
+async def admin_export_messages_ndjson(request: Request):
+    try:
+        _require_admin(request)
+    except PermissionError as e:
+        return JSONResponse({"error": str(e)}, status_code=401)
+
+    if not SessionLocal:
+        return JSONResponse({"error": "DATABASE_URL is not configured"}, status_code=501)
+
+    qp = request.query_params
+    dt_from = _parse_dt(qp.get("from"))
+    dt_to = _parse_dt(qp.get("to"))
+    roles = [r.strip() for r in qp.get("role", "").split(',') if r.strip()] or None
+    origin_param = qp.get("origin")
+    thread_param = qp.get("thread_id")
+    has_lead = _parse_bool(qp.get("has_lead"))
+    lead_param = qp.get("lead_id")
+    tool_param = qp.get("tool_name")
+    search_param = qp.get("search")
+
+    session = SessionLocal()
+
+    def generate():
+        try:
+            q = session.query(Message, Conversation).join(Conversation, Message.conversation_id == Conversation.id)
+            if roles:
+                q = q.filter(Message.role.in_(roles))
+            if dt_from:
+                q = q.filter(Message.created_at >= dt_from)
+            if dt_to:
+                q = q.filter(Message.created_at <= dt_to)
+            if origin_param:
+                if origin_param.startswith("*"):
+                    q = q.filter(Conversation.origin.ilike(f"%{origin_param[1:]}"))
+                else:
+                    q = q.filter(Conversation.origin == origin_param)
+            if thread_param:
+                q = q.filter(Conversation.thread_id == thread_param)
+            if has_lead is True:
+                q = q.filter(Conversation.lead_id.isnot(None))
+            elif has_lead is False:
+                q = q.filter(Conversation.lead_id.is_(None))
+            if lead_param:
+                try:
+                    q = q.filter(Conversation.lead_id == int(lead_param))
+                except Exception:
+                    pass
+            if tool_param:
+                if tool_param == "*":
+                    q = q.filter(Message.tool_name.isnot(None))
+                else:
+                    q = q.filter(Message.tool_name == tool_param)
+            if search_param:
+                q = q.filter(Message.content.ilike(f"%{search_param}%"))
+
+            q = q.order_by(Message.created_at.asc(), Message.id.asc())
+            for m, c in q.yield_per(1000):
+                row = {
+                    "id": m.id,
+                    "role": m.role,
+                    "content": m.content,
+                    "tool_name": m.tool_name,
+                    "tool_args": m.tool_args,
+                    "created_at": m.created_at.isoformat() if m.created_at else None,
+                    "conversation": {
+                        "id": c.id,
+                        "thread_id": c.thread_id,
+                        "lead_id": c.lead_id,
+                        "origin": c.origin,
+                        "created_at": c.created_at.isoformat() if c.created_at else None,
+                    }
+                }
+                yield json.dumps(row, ensure_ascii=False) + "\n"
+        finally:
+            session.close()
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+@app.get("/admin/export/messages.csv")
+async def admin_export_messages_csv(request: Request):
+    try:
+        _require_admin(request)
+    except PermissionError as e:
+        return JSONResponse({"error": str(e)}, status_code=401)
+
+    if not SessionLocal:
+        return JSONResponse({"error": "DATABASE_URL is not configured"}, status_code=501)
+
+    qp = request.query_params
+    dt_from = _parse_dt(qp.get("from"))
+    dt_to = _parse_dt(qp.get("to"))
+    roles = [r.strip() for r in qp.get("role", "").split(',') if r.strip()] or None
+    origin_param = qp.get("origin")
+    thread_param = qp.get("thread_id")
+    has_lead = _parse_bool(qp.get("has_lead"))
+    lead_param = qp.get("lead_id")
+    tool_param = qp.get("tool_name")
+    search_param = qp.get("search")
+
+    session = SessionLocal()
+
+    def generate():
+        try:
+            q = session.query(Message, Conversation).join(Conversation, Message.conversation_id == Conversation.id)
+            if roles:
+                q = q.filter(Message.role.in_(roles))
+            if dt_from:
+                q = q.filter(Message.created_at >= dt_from)
+            if dt_to:
+                q = q.filter(Message.created_at <= dt_to)
+            if origin_param:
+                if origin_param.startswith("*"):
+                    q = q.filter(Conversation.origin.ilike(f"%{origin_param[1:]}"))
+                else:
+                    q = q.filter(Conversation.origin == origin_param)
+            if thread_param:
+                q = q.filter(Conversation.thread_id == thread_param)
+            if has_lead is True:
+                q = q.filter(Conversation.lead_id.isnot(None))
+            elif has_lead is False:
+                q = q.filter(Conversation.lead_id.is_(None))
+            if lead_param:
+                try:
+                    q = q.filter(Conversation.lead_id == int(lead_param))
+                except Exception:
+                    pass
+            if tool_param:
+                if tool_param == "*":
+                    q = q.filter(Message.tool_name.isnot(None))
+                else:
+                    q = q.filter(Message.tool_name == tool_param)
+            if search_param:
+                q = q.filter(Message.content.ilike(f"%{search_param}%"))
+
+            q = q.order_by(Message.created_at.asc(), Message.id.asc())
+
+            # CSV header
+            header = [
+                "msg_id", "role", "content", "tool_name", "tool_args", "msg_created_at",
+                "conv_id", "thread_id", "lead_id", "origin", "conv_created_at"
+            ]
+            sio = io.StringIO()
+            writer = csv.writer(sio)
+            writer.writerow(header)
+            yield sio.getvalue()
+            sio.seek(0)
+            sio.truncate(0)
+
+            for m, c in q.yield_per(1000):
+                row = [
+                    m.id, m.role, m.content, m.tool_name, json.dumps(m.tool_args, ensure_ascii=False) if m.tool_args else "",
+                    m.created_at.isoformat() if m.created_at else "",
+                    c.id, c.thread_id, c.lead_id if c.lead_id is not None else "", c.origin,
+                    c.created_at.isoformat() if c.created_at else "",
+                ]
+                writer.writerow(row)
+                yield sio.getvalue()
+                sio.seek(0)
+                sio.truncate(0)
+        finally:
+            session.close()
+
+    return StreamingResponse(generate(), media_type="text/csv", headers={
+        "Content-Disposition": "attachment; filename=messages.csv"
+    })
