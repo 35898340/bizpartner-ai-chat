@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from openai import OpenAI
-import os, time, json
+import os, time, json, asyncio
 import requests
 
 app = FastAPI()
@@ -99,6 +99,18 @@ def create_bitrix_lead(args: dict) -> int:
     # sometimes Bitrix returns {"result": <id>} handled in _bitrix_call, but keep a safeguard
     return int(result)
 
+def _extract_last_text_message(client: OpenAI, thread_id: str) -> str:
+    messages = client.beta.threads.messages.list(thread_id, order="desc")
+    for message in messages.data:
+        if getattr(message, "role", None) != "assistant":
+            continue
+        for part in getattr(message, "content", []):
+            if getattr(part, "type", None) == "text" and getattr(part, "text", None):
+                text_value = getattr(part.text, "value", None)
+                if isinstance(text_value, str) and text_value.strip():
+                    return text_value
+    return ""
+
 # ── Модель входящего запроса ──────────────────────────────────────────────
 class ChatRequest(BaseModel):
     message: str
@@ -132,7 +144,11 @@ async def chat(req: ChatRequest, request: Request):
         )
 
         last_lead_id: int | None = None
+        deadline = time.time() + 90  # fail-safe to avoid indefinite wait
         while True:
+            if time.time() > deadline:
+                raise TimeoutError("Assistant run timeout")
+
             run_status = client.beta.threads.runs.retrieve(
                 run_id=run.id,
                 thread_id=thread_id
@@ -148,17 +164,23 @@ async def chat(req: ChatRequest, request: Request):
                     except Exception:
                         fn_args = {}
 
-                    if fn_name in {"create_bitrix_lead", "crm_create_lead", "create_lead"}:
-                        lead_id = create_bitrix_lead(fn_args)
-                        last_lead_id = lead_id
+                    try:
+                        if fn_name in {"create_bitrix_lead", "crm_create_lead", "create_lead"}:
+                            lead_id = create_bitrix_lead(fn_args)
+                            last_lead_id = lead_id
+                            tool_outputs.append({
+                                "tool_call_id": tool_call.id,
+                                "output": json.dumps({"ok": True, "lead_id": lead_id})
+                            })
+                        else:
+                            tool_outputs.append({
+                                "tool_call_id": tool_call.id,
+                                "output": json.dumps({"ok": False, "error": f"unknown function: {fn_name}"})
+                            })
+                    except Exception as tool_error:
                         tool_outputs.append({
                             "tool_call_id": tool_call.id,
-                            "output": json.dumps({"ok": True, "lead_id": lead_id})
-                        })
-                    else:
-                        tool_outputs.append({
-                            "tool_call_id": tool_call.id,
-                            "output": json.dumps({"ok": False, "error": f"unknown function: {fn_name}"})
+                            "output": json.dumps({"ok": False, "error": str(tool_error)})
                         })
 
                 client.beta.threads.runs.submit_tool_outputs(
@@ -172,11 +194,10 @@ async def chat(req: ChatRequest, request: Request):
                 break
             if run_status.status in {"failed", "cancelled", "expired"}:
                 raise RuntimeError(f"Run {run.id} ended with {run_status.status}")
-            time.sleep(1)
+            await asyncio.sleep(1)
 
         # 5. ответ ассистента
-        messages = client.beta.threads.messages.list(thread_id, order="desc")
-        reply = messages.data[0].content[0].text.value
+        reply = _extract_last_text_message(client, thread_id) or ""
 
         resp = {"reply": reply}
         if last_lead_id is not None:
