@@ -23,14 +23,27 @@ ALLOWED_ORIGINS = {
     "http://localhost:3000",     "http://localhost:5173",
     "http://127.0.0.1:3000",     "http://127.0.0.1:5173",
 }
+ALLOWED_SUFFIXES = (
+    ".lovable.dev", ".lovable.io", ".lovable.app",
+    ".bizpartner.pl",
+)
+
+def _is_allowed_origin(origin: str) -> bool:
+    if not origin:
+        return False
+    o = origin.lower()
+    if o in ALLOWED_ORIGINS:
+        return True
+    return any(o.endswith(suffix) for suffix in ALLOWED_SUFFIXES)
 
 def cors_headers(origin: str) -> dict:
-    allow = origin if origin in ALLOWED_ORIGINS else "*"
+    allow_origin = origin if _is_allowed_origin(origin) else "*"
     return {
-        "Access-Control-Allow-Origin":      allow,
+        "Access-Control-Allow-Origin":      allow_origin,
         "Access-Control-Allow-Methods":     "POST, OPTIONS",
         "Access-Control-Allow-Headers":     "Content-Type, Authorization",
-        "Access-Control-Allow-Credentials": "true" if allow != "*" else "false",
+        "Access-Control-Allow-Credentials": "true" if allow_origin != "*" else "false",
+        "Vary": "Origin",
     }
 
 # ── In-memory :  lead_id ↔ thread_id ───────────────────────────────────────
