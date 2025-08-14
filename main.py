@@ -25,6 +25,7 @@ client       = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 ASSISTANT_ID = os.getenv("ASSISTANT_ID")            # Railway → Variables
 BITRIX_WEBHOOK_URL = os.getenv("BITRIX_WEBHOOK_URL") or os.getenv("BITRIX_WEBHOOK")
 DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 
 # ── DB setup ───────────────────────────────────────────────────────────────
 Base = declarative_base()
@@ -346,3 +347,138 @@ async def chat_options(request: Request):
         headers["Access-Control-Allow-Headers"] = acrh
     headers["Access-Control-Max-Age"] = "86400"
     return Response(status_code=204, headers=headers)
+
+# ── Admin helpers ──────────────────────────────────────────────────────────
+
+def _require_admin(request: Request):
+    if not ADMIN_TOKEN:
+        raise PermissionError("ADMIN_TOKEN is not configured")
+    token = request.headers.get("x-admin-token") or request.headers.get("X-Admin-Token")
+    if token != ADMIN_TOKEN:
+        raise PermissionError("unauthorized")
+
+# ── Admin endpoints (read-only) ────────────────────────────────────────────
+
+@app.get("/admin/conversations")
+async def admin_list_conversations(request: Request):
+    try:
+        _require_admin(request)
+    except PermissionError as e:
+        return JSONResponse({"error": str(e)}, status_code=401)
+
+    if not SessionLocal:
+        return JSONResponse({"error": "DATABASE_URL is not configured"}, status_code=501)
+
+    limit_param = request.query_params.get("limit", "50")
+    offset_param = request.query_params.get("offset", "0")
+    try:
+        limit = max(1, min(200, int(limit_param)))
+        offset = max(0, int(offset_param))
+    except Exception:
+        limit, offset = 50, 0
+
+    session = SessionLocal()
+    try:
+        q = session.query(Conversation).order_by(Conversation.created_at.desc())
+        total = q.count()
+        conversations = q.offset(offset).limit(limit).all()
+        items = []
+        for c in conversations:
+            items.append({
+                "id": c.id,
+                "thread_id": c.thread_id,
+                "lead_id": c.lead_id,
+                "origin": c.origin,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+            })
+        return JSONResponse({"total": total, "limit": limit, "offset": offset, "items": items})
+    finally:
+        session.close()
+
+@app.get("/admin/conversations/{conversation_id}/messages")
+async def admin_get_conversation_messages(conversation_id: int, request: Request):
+    try:
+        _require_admin(request)
+    except PermissionError as e:
+        return JSONResponse({"error": str(e)}, status_code=401)
+
+    if not SessionLocal:
+        return JSONResponse({"error": "DATABASE_URL is not configured"}, status_code=501)
+
+    session = SessionLocal()
+    try:
+        conv = session.query(Conversation).filter_by(id=conversation_id).one_or_none()
+        if not conv:
+            return JSONResponse({"error": "conversation not found"}, status_code=404)
+        msgs = (
+            session.query(Message)
+            .filter_by(conversation_id=conv.id)
+            .order_by(Message.created_at.asc(), Message.id.asc())
+            .all()
+        )
+        items = []
+        for m in msgs:
+            items.append({
+                "id": m.id,
+                "role": m.role,
+                "content": m.content,
+                "tool_name": m.tool_name,
+                "tool_args": m.tool_args,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            })
+        return JSONResponse({
+            "conversation": {
+                "id": conv.id,
+                "thread_id": conv.thread_id,
+                "lead_id": conv.lead_id,
+                "origin": conv.origin,
+                "created_at": conv.created_at.isoformat() if conv.created_at else None,
+            },
+            "messages": items,
+        })
+    finally:
+        session.close()
+
+@app.get("/admin/threads/{thread_id}/messages")
+async def admin_get_thread_messages(thread_id: str, request: Request):
+    try:
+        _require_admin(request)
+    except PermissionError as e:
+        return JSONResponse({"error": str(e)}, status_code=401)
+
+    if not SessionLocal:
+        return JSONResponse({"error": "DATABASE_URL is not configured"}, status_code=501)
+
+    session = SessionLocal()
+    try:
+        conv = session.query(Conversation).filter_by(thread_id=thread_id).one_or_none()
+        if not conv:
+            return JSONResponse({"error": "conversation not found"}, status_code=404)
+        msgs = (
+            session.query(Message)
+            .filter_by(conversation_id=conv.id)
+            .order_by(Message.created_at.asc(), Message.id.asc())
+            .all()
+        )
+        items = []
+        for m in msgs:
+            items.append({
+                "id": m.id,
+                "role": m.role,
+                "content": m.content,
+                "tool_name": m.tool_name,
+                "tool_args": m.tool_args,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            })
+        return JSONResponse({
+            "conversation": {
+                "id": conv.id,
+                "thread_id": conv.thread_id,
+                "lead_id": conv.lead_id,
+                "origin": conv.origin,
+                "created_at": conv.created_at.isoformat() if conv.created_at else None,
+            },
+            "messages": items,
+        })
+    finally:
+        session.close()
