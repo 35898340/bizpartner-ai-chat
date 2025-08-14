@@ -40,7 +40,12 @@ lead_threads: dict[str, str] = {}
 def _bitrix_call(method: str, payload: dict) -> dict:
     if not BITRIX_WEBHOOK_URL:
         raise RuntimeError("Bitrix24 webhook URL is not configured. Set BITRIX_WEBHOOK_URL env var.")
-    url = f"{BITRIX_WEBHOOK_URL.rstrip('/')}/{method}.json"
+    base = BITRIX_WEBHOOK_URL.rstrip('/')
+    # Accept both base webhook URL and a full method endpoint that already ends with .json
+    if base.endswith('.json'):
+        url = base
+    else:
+        url = f"{base}/{method}.json"
     resp = requests.post(url, json=payload, timeout=15)
     resp.raise_for_status()
     data = resp.json()
