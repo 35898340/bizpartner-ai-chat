@@ -381,7 +381,7 @@ async def chat_options(request: Request):
 
 # ── Публичная история переписки по thread_id ───────────────────────────────
 @app.get("/chat/history")
-async def chat_history(request: Request, thread_id: str, limit: int = 500, offset: int = 0, include_tools: Optional[bool] = None):
+async def chat_history(request: Request, thread_id: Optional[str] = None, threadId: Optional[str] = None, limit: int = 500, offset: int = 0, include_tools: Optional[bool] = None):
     origin  = request.headers.get("origin", "")
     headers = cors_headers(origin)
 
@@ -392,10 +392,15 @@ async def chat_history(request: Request, thread_id: str, limit: int = 500, offse
     except Exception:
         limit_val, offset_val = 500, 0
 
+    # normalize thread id
+    tid = thread_id or threadId
+    if not tid:
+        return JSONResponse({"error": "thread_id is required"}, status_code=400, headers=headers)
+
     # helper: fetch history from OpenAI directly
     def _openai_history_response() -> JSONResponse:
         try:
-            messages = client.beta.threads.messages.list(thread_id, order="asc")
+            messages = client.beta.threads.messages.list(tid, order="asc")
         except Exception as e:
             return JSONResponse({"error": f"OpenAI fetch failed: {e}"}, status_code=502, headers=headers)
         items_all = []
@@ -426,7 +431,7 @@ async def chat_history(request: Request, thread_id: str, limit: int = 500, offse
         return JSONResponse({
             "conversation": {
                 "id": None,
-                "thread_id": thread_id,
+                "thread_id": tid,
                 "lead_id": None,
                 "origin": None,
                 "created_at": None,
@@ -443,7 +448,7 @@ async def chat_history(request: Request, thread_id: str, limit: int = 500, offse
     # Normal path: read from DB, otherwise fallback
     session = SessionLocal()
     try:
-        conv = session.query(Conversation).filter_by(thread_id=thread_id).one_or_none()
+        conv = session.query(Conversation).filter_by(thread_id=tid).one_or_none()
         if not conv:
             return _openai_history_response()
 
