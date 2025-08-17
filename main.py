@@ -225,6 +225,7 @@ def _parse_dt(value: Optional[str]) -> Optional[datetime]:
 class ChatRequest(BaseModel):
     message: str
     lead_id: str | None = None          # используйте, если нужно «склеивать» диалог
+    thread_id: str | None = None        # предпочтительно: передавайте thread_id для продолжения диалога
 
 # ── POST /chat ────────────────────────────────────────────────────────────
 @app.post("/chat")
@@ -237,13 +238,13 @@ async def chat(req: ChatRequest, request: Request):
             print(f"[chat] origin={origin} lead_id_in={req.lead_id} message={req.message[:80]!r}")
 
         # 1. thread для клиента
-        thread_id = lead_threads.get(req.lead_id) if req.lead_id else None
+        thread_id = req.thread_id or (lead_threads.get(req.lead_id) if req.lead_id else None)
         if not thread_id:
             thread_id = client.beta.threads.create().id
             if req.lead_id:
                 lead_threads[req.lead_id] = thread_id
         if DEBUG:
-            print(f"[chat] thread_id={thread_id}")
+            print(f"[chat] thread_id={thread_id} (in={req.thread_id})")
 
         # 2. сообщение пользователя
         client.beta.threads.messages.create(
@@ -344,7 +345,7 @@ async def chat(req: ChatRequest, request: Request):
         except Exception:
             pass
 
-        resp = {"reply": reply}
+        resp = {"reply": reply, "thread_id": thread_id}
         if last_lead_id is not None:
             resp["lead_id"] = last_lead_id
         return JSONResponse(resp, headers=headers)
