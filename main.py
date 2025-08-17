@@ -3,7 +3,7 @@
 # ────────────────────────────────────────────────────────────────────────────
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from openai import OpenAI
 import os, time, json, asyncio, csv, io
 import requests
@@ -88,7 +88,7 @@ def cors_headers(origin: str) -> dict:
     allow_origin = origin if _is_allowed_origin(origin) else "*"
     return {
         "Access-Control-Allow-Origin":      allow_origin,
-        "Access-Control-Allow-Methods":     "POST, OPTIONS",
+        "Access-Control-Allow-Methods":     "POST, GET, OPTIONS",
         "Access-Control-Allow-Headers":     "Content-Type, Authorization, X-Requested-With",
         "Access-Control-Allow-Credentials": "true" if allow_origin != "*" else "false",
         "Vary": "Origin",
@@ -225,6 +225,7 @@ def _parse_dt(value: Optional[str]) -> Optional[datetime]:
 class ChatRequest(BaseModel):
     message: str
     lead_id: str | None = None          # используйте, если нужно «склеивать» диалог
+    thread_id: str | None = Field(default=None, alias="threadId")  # поддерживаем snakeCase и camelCase
 
 # ── POST /chat ────────────────────────────────────────────────────────────
 @app.post("/chat")
@@ -236,14 +237,23 @@ async def chat(req: ChatRequest, request: Request):
         if DEBUG:
             print(f"[chat] origin={origin} lead_id_in={req.lead_id} message={req.message[:80]!r}")
 
+        # Попытка извлечь thread_id/threadId напрямую из тела запроса для максимальной совместимости
+        body_thread_id = None
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                body_thread_id = body.get("thread_id") or body.get("threadId")
+        except Exception:
+            body_thread_id = None
+
         # 1. thread для клиента
-        thread_id = lead_threads.get(req.lead_id) if req.lead_id else None
+        thread_id = req.thread_id or body_thread_id or (lead_threads.get(req.lead_id) if req.lead_id else None)
         if not thread_id:
             thread_id = client.beta.threads.create().id
             if req.lead_id:
                 lead_threads[req.lead_id] = thread_id
         if DEBUG:
-            print(f"[chat] thread_id={thread_id}")
+            print(f"[chat] thread_id={thread_id} (in={req.thread_id} body_in={body_thread_id})")
 
         # 2. сообщение пользователя
         client.beta.threads.messages.create(
@@ -344,7 +354,7 @@ async def chat(req: ChatRequest, request: Request):
         except Exception:
             pass
 
-        resp = {"reply": reply}
+        resp = {"reply": reply, "thread_id": thread_id, "threadId": thread_id}
         if last_lead_id is not None:
             resp["lead_id"] = last_lead_id
         return JSONResponse(resp, headers=headers)
@@ -353,7 +363,7 @@ async def chat(req: ChatRequest, request: Request):
         if DEBUG:
             print(f"[chat] error: {e}")
         return JSONResponse(
-            {"error": str(e)},
+            {"error": str(e), "thread_id": req.thread_id, "threadId": req.thread_id},
             status_code=500,
             headers=headers
         )
@@ -368,6 +378,113 @@ async def chat_options(request: Request):
         headers["Access-Control-Allow-Headers"] = acrh
     headers["Access-Control-Max-Age"] = "86400"
     return Response(status_code=204, headers=headers)
+
+# ── Публичная история переписки по thread_id ───────────────────────────────
+@app.get("/chat/history")
+async def chat_history(request: Request, thread_id: Optional[str] = None, threadId: Optional[str] = None, limit: int = 500, offset: int = 0, include_tools: Optional[bool] = None):
+    origin  = request.headers.get("origin", "")
+    headers = cors_headers(origin)
+
+    # normalize pagination
+    try:
+        limit_val = max(1, min(1000, int(limit)))
+        offset_val = max(0, int(offset))
+    except Exception:
+        limit_val, offset_val = 500, 0
+
+    # normalize thread id
+    tid = thread_id or threadId
+    if not tid:
+        return JSONResponse({"error": "thread_id is required"}, status_code=400, headers=headers)
+
+    # helper: fetch history from OpenAI directly
+    def _openai_history_response() -> JSONResponse:
+        try:
+            messages = client.beta.threads.messages.list(tid, order="asc")
+        except Exception as e:
+            return JSONResponse({"error": f"OpenAI fetch failed: {e}"}, status_code=502, headers=headers)
+        items_all = []
+        seq = 1
+        for m in messages.data:
+            role = getattr(m, "role", None)
+            if role not in {"user", "assistant"} and include_tools is not True:
+                continue
+            text_parts: list[str] = []
+            for part in getattr(m, "content", []) or []:
+                if getattr(part, "type", None) == "text" and getattr(part, "text", None):
+                    value = getattr(getattr(part, "text", None), "value", None)
+                    if isinstance(value, str) and value:
+                        text_parts.append(value)
+            content = "\n\n".join(text_parts).strip()
+            if not content:
+                continue
+            items_all.append({
+                "id": seq,  # synthetic numeric id for UI stability
+                "role": role,
+                "content": content,
+                "tool_name": None,
+                "created_at": None,
+            })
+            seq += 1
+        # pagination
+        items_page = items_all[offset_val: offset_val + limit_val]
+        return JSONResponse({
+            "conversation": {
+                "id": None,
+                "thread_id": tid,
+                "lead_id": None,
+                "origin": None,
+                "created_at": None,
+            },
+            "items": items_page,
+            "limit": limit_val,
+            "offset": offset_val,
+        }, headers=headers)
+
+    # If DB is not configured, fall back to OpenAI
+    if not SessionLocal:
+        return _openai_history_response()
+
+    # Normal path: read from DB, otherwise fallback
+    session = SessionLocal()
+    try:
+        conv = session.query(Conversation).filter_by(thread_id=tid).one_or_none()
+        if not conv:
+            return _openai_history_response()
+
+        q = session.query(Message).filter_by(conversation_id=conv.id)
+        if include_tools is not True:
+            q = q.filter(Message.role.in_(["user", "assistant"]))
+        q = q.order_by(Message.created_at.asc(), Message.id.asc())
+        rows = q.all()
+        if not rows:
+            return _openai_history_response()
+        # pagination in-memory for consistent behavior
+        rows = rows[offset_val: offset_val + limit_val]
+
+        items = []
+        for m in rows:
+            items.append({
+                "id": m.id,
+                "role": m.role,
+                "content": m.content,
+                "tool_name": m.tool_name,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            })
+        return JSONResponse({
+            "conversation": {
+                "id": conv.id,
+                "thread_id": conv.thread_id,
+                "lead_id": conv.lead_id,
+                "origin": conv.origin,
+                "created_at": conv.created_at.isoformat() if conv.created_at else None,
+            },
+            "items": items,
+            "limit": limit_val,
+            "offset": offset_val,
+        }, headers=headers)
+    finally:
+        session.close()
 
 # ── Admin helpers ──────────────────────────────────────────────────────────
 
@@ -421,7 +538,7 @@ async def admin_list_conversations(request: Request):
             q = q.filter(Conversation.thread_id == thread_param)
         if origin_param:
             if origin_param.startswith("*"):
-                q = q.filter(Conversation.origin.ilike(f"%{origin_param[1:]}"))
+                q = q.filter(Conversation.origin.ilike(f"%{origin_param[1:]}") )
             else:
                 q = q.filter(Conversation.origin == origin_param)
         if has_lead is True:
@@ -617,7 +734,7 @@ async def admin_list_messages(request: Request):
             q = q.filter(Conversation.thread_id == thread_param)
         if origin_param:
             if origin_param.startswith("*"):
-                q = q.filter(Conversation.origin.ilike(f"%{origin_param[1:]}"))
+                q = q.filter(Conversation.origin.ilike(f"%{origin_param[1:]}") )
             else:
                 q = q.filter(Conversation.origin == origin_param)
         if tool_param:
@@ -691,7 +808,7 @@ async def admin_export_messages_ndjson(request: Request):
                 q = q.filter(Message.created_at <= dt_to)
             if origin_param:
                 if origin_param.startswith("*"):
-                    q = q.filter(Conversation.origin.ilike(f"%{origin_param[1:]}"))
+                    q = q.filter(Conversation.origin.ilike(f"%{origin_param[1:]}") )
                 else:
                     q = q.filter(Conversation.origin == origin_param)
             if thread_param:
@@ -770,7 +887,7 @@ async def admin_export_messages_csv(request: Request):
                 q = q.filter(Message.created_at <= dt_to)
             if origin_param:
                 if origin_param.startswith("*"):
-                    q = q.filter(Conversation.origin.ilike(f"%{origin_param[1:]}"))
+                    q = q.filter(Conversation.origin.ilike(f"%{origin_param[1:]}") )
                 else:
                     q = q.filter(Conversation.origin == origin_param)
             if thread_param:
@@ -823,3 +940,67 @@ async def admin_export_messages_csv(request: Request):
     return StreamingResponse(generate(), media_type="text/csv", headers={
         "Content-Disposition": "attachment; filename=messages.csv"
     })
+
+# ── Admin: import OpenAI thread messages into DB ───────────────────────────
+@app.post("/admin/threads/{thread_id}/import_openai")
+async def admin_import_openai_thread(thread_id: str, request: Request):
+    try:
+        _require_admin(request)
+    except PermissionError as e:
+        return JSONResponse({"error": str(e)}, status_code=401)
+
+    origin  = request.headers.get("origin", "")
+
+    if not SessionLocal:
+        return JSONResponse({"error": "DATABASE_URL is not configured"}, status_code=501)
+
+    # Read query flags
+    force = (request.query_params.get("force", "false").lower() in {"1", "true", "yes", "on"})
+
+    # Build existing messages set for dedup when not forcing
+    existing_pairs: set[tuple[str, str]] = set()
+    session = SessionLocal()
+    try:
+        conv = session.query(Conversation).filter_by(thread_id=thread_id).one_or_none()
+        if conv:
+            if not force:
+                rows = (
+                    session.query(Message.role, Message.content)
+                    .filter(Message.conversation_id == conv.id)
+                    .all()
+                )
+                existing_pairs = {(r, c) for (r, c) in rows}
+    finally:
+        session.close()
+
+    # Fetch from OpenAI
+    imported = 0
+    skipped = 0
+    try:
+        messages = client.beta.threads.messages.list(thread_id, order="asc")
+    except Exception as e:
+        return JSONResponse({"error": f"OpenAI fetch failed: {e}"}, status_code=502)
+
+    for m in messages.data:
+        role = getattr(m, "role", None)
+        if role not in {"user", "assistant"}:
+            continue
+        text_parts: list[str] = []
+        for part in getattr(m, "content", []) or []:
+            if getattr(part, "type", None) == "text" and getattr(part, "text", None):
+                value = getattr(getattr(part, "text", None), "value", None)
+                if isinstance(value, str) and value:
+                    text_parts.append(value)
+        content = "\n\n".join(text_parts).strip()
+        if not content:
+            continue
+        if not force and (role, content) in existing_pairs:
+            skipped += 1
+            continue
+        try:
+            _save_message(thread_id, origin, role=role, content=content)
+            imported += 1
+        except Exception:
+            pass
+
+    return JSONResponse({"thread_id": thread_id, "imported": imported, "skipped": skipped, "force": force})
