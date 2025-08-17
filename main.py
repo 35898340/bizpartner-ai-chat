@@ -385,27 +385,78 @@ async def chat_history(request: Request, thread_id: str, limit: int = 500, offse
     origin  = request.headers.get("origin", "")
     headers = cors_headers(origin)
 
-    if not SessionLocal:
-        return JSONResponse({"error": "DATABASE_URL is not configured"}, status_code=501, headers=headers)
-
+    # normalize pagination
     try:
         limit_val = max(1, min(1000, int(limit)))
         offset_val = max(0, int(offset))
     except Exception:
         limit_val, offset_val = 500, 0
 
+    # helper: fetch history from OpenAI directly
+    def _openai_history_response() -> JSONResponse:
+        try:
+            messages = client.beta.threads.messages.list(thread_id, order="asc")
+        except Exception as e:
+            return JSONResponse({"error": f"OpenAI fetch failed: {e}"}, status_code=502, headers=headers)
+        items_all = []
+        seq = 1
+        for m in messages.data:
+            role = getattr(m, "role", None)
+            if role not in {"user", "assistant"} and include_tools is not True:
+                continue
+            text_parts: list[str] = []
+            for part in getattr(m, "content", []) or []:
+                if getattr(part, "type", None) == "text" and getattr(part, "text", None):
+                    value = getattr(getattr(part, "text", None), "value", None)
+                    if isinstance(value, str) and value:
+                        text_parts.append(value)
+            content = "\n\n".join(text_parts).strip()
+            if not content:
+                continue
+            items_all.append({
+                "id": seq,  # synthetic numeric id for UI stability
+                "role": role,
+                "content": content,
+                "tool_name": None,
+                "created_at": None,
+            })
+            seq += 1
+        # pagination
+        items_page = items_all[offset_val: offset_val + limit_val]
+        return JSONResponse({
+            "conversation": {
+                "id": None,
+                "thread_id": thread_id,
+                "lead_id": None,
+                "origin": None,
+                "created_at": None,
+            },
+            "items": items_page,
+            "limit": limit_val,
+            "offset": offset_val,
+        }, headers=headers)
+
+    # If DB is not configured, fall back to OpenAI
+    if not SessionLocal:
+        return _openai_history_response()
+
+    # Normal path: read from DB, otherwise fallback
     session = SessionLocal()
     try:
         conv = session.query(Conversation).filter_by(thread_id=thread_id).one_or_none()
         if not conv:
-            return JSONResponse({"thread_id": thread_id, "items": []}, headers=headers)
+            return _openai_history_response()
 
         q = session.query(Message).filter_by(conversation_id=conv.id)
         if include_tools is not True:
             q = q.filter(Message.role.in_(["user", "assistant"]))
         q = q.order_by(Message.created_at.asc(), Message.id.asc())
-        q = q.offset(offset_val).limit(limit_val)
         rows = q.all()
+        if not rows:
+            return _openai_history_response()
+        # pagination in-memory for consistent behavior
+        rows = rows[offset_val: offset_val + limit_val]
+
         items = []
         for m in rows:
             items.append({
